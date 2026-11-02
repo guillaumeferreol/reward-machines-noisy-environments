@@ -7,7 +7,7 @@ def worker(conn, env):
         if cmd == "step":
             obs, reward, terminated, truncated, info = env.step(data)
             if terminated or truncated:
-                obs = env.reset()
+                obs, _ = env.reset()
             conn.send((obs, reward, terminated, truncated, info))
         elif cmd == "reset":
             obs, _ = env.reset()

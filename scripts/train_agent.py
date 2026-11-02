@@ -1,6 +1,7 @@
 import argparse
 import time
 import datetime
+import math
 import torch
 import torch_ac
 import sys
@@ -10,40 +11,48 @@ import glob
 
 import utils
 from model import ACModel, RecurrentACModel
+from simbav2_model import SimbaV2SACModel
 from detector_model import *
 
 # Parse arguments
 parser = argparse.ArgumentParser()
 
 ## General parameters
+parser.add_argument("--algo", choices=["ppo", "sac"], default="ppo",
+                    help="learning algorithm: ppo (recurrent PPO) or sac (off-policy SAC + SimbaV2, "
+                         "https://proceedings.mlr.press/v267/lee25u.html) (default: ppo)")
 parser.add_argument("--env", required=True,
                     help="name of the environment to train on (REQUIRED)")
 parser.add_argument("--seed", type=int, default=1,
                     help="random seed (default: 1)")
 parser.add_argument("--log-interval", type=int, default=1,
                     help="number of updates between two logs (default: 1)")
-parser.add_argument("--save-interval", type=int, default=20,
-                    help="number of updates between two saves (default: 20, 0 means no saving)")
+parser.add_argument("--save-interval", type=int, default=None,
+                    help="number of updates between two saves (default: 20 for PPO, 100 for SAC, 0 means no saving)")
 parser.add_argument("--procs", type=int, default=1,
                     help="number of processes (default: 1)")
-parser.add_argument("--frames", type=int, default=5*10**7,
-                    help="number of frames of training (default: 5*10e8)")
+parser.add_argument("--frames", type=int, default=None,
+                    help="number of frames of training (default: 5e7 for PPO, 1e6 for SAC)")
+parser.add_argument("--frames-per-proc", type=int, default=100,
+                    help="number of frames per process before update (default: 100). With SAC, only the detector "
+                         "is updated and a log line is written at that interval; SAC updates happen at every step.")
 parser.add_argument("--load-model", default=None,
                     help="Directory of the model to load")
 parser.add_argument("--wandb", action="store_true", default=False,
                     help="Log the experiment with weights & biases")
 
+## Parameters shared by PPO and SAC
+parser.add_argument("--batch-size", type=int, default=None,
+                    help="batch size (default: 100 for PPO, 256 for SAC)")
+parser.add_argument("--discount", type=float, default=None,
+                    help="discount factor (default: 0.99 for PPO; for SAC, the TD-MPC2 heuristic from the episode "
+                         "length T, clip((T/5 - 1) / (T/5), 0.95, 0.995))")
+parser.add_argument("--lr", type=float, default=None,
+                    help="learning rate (default: 0.0003 for PPO; 1e-4 for SAC, decaying linearly to --lr-end)")
+
 ## Parameters for PPO algorithm
 parser.add_argument("--epochs", type=int, default=4,
                     help="number of epochs for PPO (default: 4)")
-parser.add_argument("--batch-size", type=int, default=100,
-                    help="batch size for PPO (default: 100)")
-parser.add_argument("--frames-per-proc", type=int, default=100,
-                    help="number of frames per process before update")
-parser.add_argument("--discount", type=float, default=0.99,
-                    help="discount factor (default: 0.99)")
-parser.add_argument("--lr", type=float, default=0.0003,
-                    help="learning rate (default: 0.0003)")
 parser.add_argument("--gae-lambda", type=float, default=0.95,
                     help="lambda coefficient in GAE formula (default: 0.95, 1 means no gae)")
 parser.add_argument("--entropy-coef", type=float, default=0.001,
@@ -61,6 +70,39 @@ parser.add_argument("--recurrence", type=int, default=4,
 parser.add_argument("--hidden-size", type=int, default=128,
                     help="hidden dimensions for actor-critic.")
 
+## Parameters for SAC + SimbaV2 (defaults from Table 3 of the paper)
+parser.add_argument("--utd-ratio", type=float, default=2.0,
+                    help="number of SAC updates per frame (default: 2)")
+parser.add_argument("--buffer-size", type=int, default=10**6,
+                    help="replay buffer capacity (default: 1e6)")
+parser.add_argument("--learning-starts", type=int, default=5000,
+                    help="number of transitions collected with random actions before training (default: 5000)")
+parser.add_argument("--lr-end", type=float, default=3e-5,
+                    help="final learning rate of SAC, reached linearly at the end of training (default: 3e-5)")
+parser.add_argument("--tau", type=float, default=0.005,
+                    help="target critic momentum (default: 0.005)")
+parser.add_argument("--temperature-init", type=float, default=0.01,
+                    help="initial entropy temperature (default: 0.01)")
+parser.add_argument("--target-entropy-scale", type=float, default=0.5,
+                    help="target entropy is -scale * |A| for continuous actions and scale * log|A| for discrete "
+                         "actions (default: 0.5)")
+parser.add_argument("--cdq", action=argparse.BooleanOptionalAction, default=True,
+                    help="clipped double Q-learning with two critics (default: on, since the RM tasks terminate)")
+parser.add_argument("--actor-hidden-size", type=int, default=128,
+                    help="hidden dimension of the SimbaV2 actor (default: 128)")
+parser.add_argument("--actor-blocks", type=int, default=1,
+                    help="number of SimbaV2 blocks in the actor (default: 1)")
+parser.add_argument("--critic-hidden-size", type=int, default=512,
+                    help="hidden dimension of the SimbaV2 critic (default: 512)")
+parser.add_argument("--critic-blocks", type=int, default=2,
+                    help="number of SimbaV2 blocks in the critic (default: 2)")
+parser.add_argument("--num-bins", type=int, default=101,
+                    help="number of atoms of the categorical critic (default: 101)")
+parser.add_argument("--g-max", type=float, default=5.0,
+                    help="support of the critic is [-g_max, g_max] after reward scaling (default: 5)")
+parser.add_argument("--c-shift", type=float, default=3.0,
+                    help="shift constant of the SimbaV2 input embedding (default: 3)")
+
 ## Parameters for training the detector
 parser.add_argument("--detector-epochs", type=int, default=4,
                     help="number of epochs for detector (default: 4)")
@@ -74,14 +116,26 @@ parser.add_argument("--rm-update-algo", type=str, default="tdm",
                     help="[tdm, naive, ibu, oracle, no_rm]")
 args = parser.parse_args()
 
+# Defaults that depend on the learning algorithm (SAC's discount is set once the environment is loaded)
+algo_defaults = {
+    "ppo": {"frames": 5*10**7, "save_interval": 20, "batch_size": 100, "lr": 0.0003, "discount": 0.99},
+    "sac": {"frames": 10**6, "save_interval": 100, "batch_size": 256, "lr": 1e-4},
+}
+for key, value in algo_defaults[args.algo].items():
+    if getattr(args, key) is None:
+        setattr(args, key, value)
+
 use_mem = args.recurrence > 1
 use_mem_detector = args.detector_recurrence > 1
 
 # Set run dir
 date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
 name = args.rm_update_algo
-recurrent = "-r" if use_mem else ""
-default_model_name = f"{name}{recurrent}-{args.env}-seed{args.seed}"
+if args.algo == "ppo":
+    recurrent = "-r" if use_mem else ""
+    default_model_name = f"{name}{recurrent}-{args.env}-seed{args.seed}"
+else:
+    default_model_name = f"sac-{name}-{args.env}-seed{args.seed}"
 pretrained_model_name = f"{name}-{args.env}-pretrained"
 model_name = default_model_name
 storage_dir = "storage"
@@ -97,13 +151,6 @@ if not args.wandb:
 wandb.init(project='noisy-detector')
 wandb.run.name = default_model_name
 wandb.run.save()
-config = wandb.config
-config.update(args)
-utils.save_config(model_dir + "/train", args)
-
-# Log command and all script arguments
-txt_logger.info("{}\n".format(" ".join(sys.argv)))
-txt_logger.info("{}\n".format(args))
 
 # Set seed for all randomness sources
 utils.seed(args.seed)
@@ -117,6 +164,18 @@ envs = []
 for i in range(args.procs):
     envs.append(utils.make_env(args.env, args.rm_update_algo, args.seed + 10000*i))
 txt_logger.info("Environments loaded\n")
+
+if args.discount is None:
+    horizon = envs[0].unwrapped.max_steps / 5
+    args.discount = max(min((horizon - 1) / horizon, 0.995), 0.95)
+
+config = wandb.config
+config.update(args)
+utils.save_config(model_dir + "/train", args)
+
+# Log command and all script arguments
+txt_logger.info("{}\n".format(" ".join(sys.argv)))
+txt_logger.info("{}\n".format(args))
 
 # Load training status
 if in_model_dir:
@@ -139,7 +198,12 @@ txt_logger.info("Observations preprocessor loaded.\n")
 # Load model
 detectormodel = getDetectorModel(envs[0], obs_space, args.rm_update_algo, use_mem_detector)
 
-if use_mem:
+if args.algo == "sac":
+    acmodel = SimbaV2SACModel(obs_space, envs[0].action_space, args.rm_update_algo,
+                              args.actor_hidden_size, args.actor_blocks,
+                              args.critic_hidden_size, args.critic_blocks, 2 if args.cdq else 1,
+                              args.num_bins, args.g_max, args.c_shift)
+elif use_mem:
     acmodel = RecurrentACModel(envs[0], obs_space, envs[0].action_space, args.rm_update_algo, args.hidden_size)
 else:
     acmodel = ACModel(envs[0], obs_space, envs[0].action_space, args.rm_update_algo, args.hidden_size)
@@ -172,14 +236,35 @@ txt_logger.info("Detector Model loaded.\n")
 txt_logger.info("{}\n".format(detectormodel))
 
 # Load algo
-algo = torch_ac.PPOAlgo(envs, acmodel, detectormodel, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
-                        args.entropy_coef, args.value_loss_coef, args.recurrence, 
-                        args.detector_epochs, args.detector_batch_size, args.detector_lr, args.detector_recurrence,
-                        args.optim_eps, args.clip_eps, args.epochs, args.batch_size, preprocess_obss, rm_update_algo=args.rm_update_algo)
+if args.algo == "ppo":
+    algo = torch_ac.PPOAlgo(envs, acmodel, detectormodel, device, args.frames_per_proc, args.discount, args.lr, args.gae_lambda,
+                            args.entropy_coef, args.value_loss_coef, args.recurrence,
+                            args.detector_epochs, args.detector_batch_size, args.detector_lr, args.detector_recurrence,
+                            args.optim_eps, args.clip_eps, args.epochs, args.batch_size, preprocess_obss, rm_update_algo=args.rm_update_algo)
 
-if "optimizer_state" in status:
-    algo.optimizer.load_state_dict(status["optimizer_state"])
-    txt_logger.info("Loading optimizer from existing run.\n")
+    if "optimizer_state" in status:
+        algo.optimizer.load_state_dict(status["optimizer_state"])
+        txt_logger.info("Loading optimizer from existing run.\n")
+else:
+    action_space = envs[0].action_space
+    if acmodel.discrete:
+        target_entropy = args.target_entropy_scale * math.log(action_space.n)
+    else:
+        target_entropy = -args.target_entropy_scale * action_space.shape[0]
+
+    algo = torch_ac.SACSimbaV2Algo(envs, acmodel, detectormodel, device, args.frames_per_proc, args.discount,
+                                   args.batch_size, args.utd_ratio, args.buffer_size, args.learning_starts,
+                                   args.lr, args.lr_end, int(args.frames * args.utd_ratio), args.tau,
+                                   args.temperature_init, target_entropy, args.g_max,
+                                   # A loaded policy fills the (empty) replay buffer itself
+                                   random_warmup="model_state" not in status,
+                                   detector_epochs=args.detector_epochs, detector_batch_size=args.detector_batch_size,
+                                   detector_lr=args.detector_lr, detector_recurrence=args.detector_recurrence,
+                                   preprocess_obss=preprocess_obss, rm_update_algo=args.rm_update_algo)
+
+    if "sac_state" in status:
+        algo.load_state_dict(status["sac_state"])
+        txt_logger.info("Loading SAC training state (target critic, temperature, optimizers) from existing run.\n")
 
 if "optimizer_detector_state" in status:
     algo.optimizer_detector.load_state_dict(status["optimizer_detector_state"])
@@ -192,9 +277,10 @@ txt_logger.info("Optimizer loaded.\n")
 num_frames = status["num_frames"]
 update = status["update"]
 start_time = time.time()
+write_csv_header = num_frames == 0
 
 while num_frames < args.frames:
-    # Update model parameters
+    # Update model parameters (SAC makes its gradient updates while collecting the experiences)
     update_start_time = time.time()
     exps, logs1 = algo.collect_experiences()
 
@@ -210,10 +296,11 @@ while num_frames < args.frames:
         }
     else:
         logs3 = algo.update_detector_parameters(exps)
-        algo.update_detector_beliefs(exps)
+        if args.algo == "ppo":
+            algo.update_detector_beliefs(exps)
 
-    logs2 = algo.update_ac_parameters(exps)
-    
+    logs2 = algo.update_ac_parameters(exps) if args.algo == "ppo" else {}
+
 
     logs = {**logs1, **logs2, **logs3}
     update_end_time = time.time()
@@ -232,6 +319,13 @@ while num_frames < args.frames:
         average_discounted_return = utils.average_discounted_return(logs["return_per_episode"], logs["num_frames_per_episode"], args.discount)
         num_frames_per_episode = utils.synthesize(logs["num_frames_per_episode"])
 
+        if args.algo == "ppo":
+            loss_keys = ["entropy", "value", "policy_loss", "value_loss", "grad_norm"]
+            loss_format = "H {:.3f} | V {:.3f} | pL {:.3f} | vL {:.3f} | ∇ {:.3f}"
+        else:
+            loss_keys = ["entropy", "temperature", "q_value", "actor_loss", "critic_loss"]
+            loss_format = "H {:.3f} | α {:.4f} | Q {:.3f} | aL {:.3f} | cL {:.3f}"
+
         header = ["update", "frames", "FPS", "duration"]
         data = [update, num_frames, fps, duration]
         header += ["rreturn_" + key for key in rreturn_per_episode.keys()]
@@ -240,21 +334,26 @@ while num_frames < args.frames:
         data += [average_reward_per_step, average_discounted_return]
         header += ["num_frames_" + key for key in num_frames_per_episode.keys()]
         data += num_frames_per_episode.values()
-        header += ["entropy", "value", "policy_loss", "value_loss", "grad_norm"]
-        data += [logs["entropy"], logs["value"], logs["policy_loss"], logs["value_loss"], logs["grad_norm"]]
+        header += loss_keys
+        data += [logs[key] for key in loss_keys]
         header += ["detector_loss_train", "detector_loss_test", "detector_top1_accuracy_train", "detector_top1_accuracy_test"]
         data += [logs["detector_loss_train"], logs["detector_loss_test"], logs["detector_top1_accuracy_train"], logs["detector_top1_accuracy_test"]]
 
         txt_logger.info(
-                "U {} | F {:06} | FPS {:04.0f} | D {} | rR:μσmM {:.2f} {:.2f} {:.2f} {:.2f} | ARPS: {:.3f} | ADR: {:.3f} | F:μσmM {:.1f} {:.1f} {} {} | H {:.3f} | V {:.3f} | pL {:.3f} | vL {:.3f} | ∇ {:.3f} | dLtrain {:.3f} | dLtest {:.3f} | dtop1Acctrain {:.3f} | dtop1Acctest {:.3f}"
+                ("U {} | F {:06} | FPS {:04.0f} | D {} | rR:μσmM {:.2f} {:.2f} {:.2f} {:.2f} | ARPS: {:.3f} | ADR: {:.3f} | F:μσmM {:.1f} {:.1f} {} {} | "
+                 + loss_format + " | dLtrain {:.3f} | dLtest {:.3f} | dtop1Acctrain {:.3f} | dtop1Acctest {:.3f}")
             .format(*data))
         header += ["detector_grad_train", "detector_grad_test"]
         data += [logs["detector_grad_train"], logs["detector_grad_test"]]
         header += ["return_" + key for key in return_per_episode.keys()]
         data += return_per_episode.values()
+        if args.algo == "sac":
+            header += ["reward_scale", "buffer_size", "num_updates"]
+            data += [logs["reward_scale"], logs["buffer_size"], logs["num_updates"]]
 
-        if status["num_frames"] == 0:
+        if write_csv_header:
             csv_logger.writerow(header)
+            write_csv_header = False
         csv_logger.writerow(data)
         csv_file.flush()
 
@@ -265,9 +364,12 @@ while num_frames < args.frames:
 
     if args.save_interval > 0 and update % args.save_interval == 0:
         status = {"num_frames": num_frames, "update": update,
-                  "model_state": algo.acmodel.state_dict(),
-                  "detector_model_state": algo.detectormodel.state_dict(),
-                  "optimizer_state": algo.optimizer.state_dict()}
+                  "model_state": acmodel.state_dict(),
+                  "detector_model_state": algo.detectormodel.state_dict()}
+        if args.algo == "ppo":
+            status["optimizer_state"] = algo.optimizer.state_dict()
+        else:
+            status["sac_state"] = algo.state_dict()
         if algo.optimizer_detector is not None:
             status["optimizer_detector_state"] = algo.optimizer_detector.state_dict()
         if hasattr(preprocess_obss, "vocab") and preprocess_obss.vocab is not None:
